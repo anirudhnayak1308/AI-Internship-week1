@@ -3,3 +3,5 @@ httpx
 openai
 python-dotenv
 streamlit
+pinecone>=5.0.0
+langchain-text-splitters>=0.3.0

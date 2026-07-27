@@ -4,14 +4,18 @@ Run:
   uvicorn main:app --host 127.0.0.1 --port 8000 --reload
 """
 
+import os
 import time
 from pathlib import Path
 from typing import Literal
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from openai import OpenAI
 from pydantic import BaseModel, Field, ValidationError
+
+from pinecone_store import query_similar, upsert_texts
 
 THIS_DIR = Path(__file__).resolve().parent
 load_dotenv(THIS_DIR / ".env")
@@ -27,6 +31,23 @@ MODEL_PRICES_PER_1K: dict[str, tuple[float, float]] = {
     "gpt-4o-mini": (0.00015, 0.0006),
     "o3-mini": (0.0011, 0.0044),
 }
+
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "800"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "100"))
+RETRIEVAL_TOP_K = int(os.getenv("RETRIEVAL_TOP_K", "5"))
+
+GROUNDING_PROMPT_TEMPLATE = """Answer the question using ONLY the context below. Do not use any outside knowledge.
+
+Rules:
+- Every factual claim in your answer must be traceable to the context. After each claim, cite the source chunk using its document_id, formatted like (source: <document_id>).
+- If the context does not contain enough information to answer confidently, do not guess. Set sources_needed to true and say in the answer field that the provided context is insufficient.
+
+Context:
+{context}
+
+Question: {question}
+
+Answer:"""
 
 
 class Answer(BaseModel):
@@ -59,6 +80,33 @@ class AskResponse(BaseModel):
     latency_ms: int
     cost_usd: float
     attempts: list[AttemptResult]
+    retrieved_chunk_ids: list[str]
+
+
+class IngestRequest(BaseModel):
+    text: str
+    document_id: str = Field(min_length=1)
+    metadata: dict = Field(default_factory=dict)
+
+
+class IngestResponse(BaseModel):
+    document_id: str
+    chunks_indexed: int
+    status: str
+
+
+class RetrievedChunk(BaseModel):
+    id: str
+    score: float
+    document_id: str | None = None
+    chunk_index: int | None = None
+    source: str | None = None
+    text: str | None = None
+
+
+class DebugRetrieveResponse(BaseModel):
+    query: str
+    matches: list[RetrievedChunk]
 
 
 @app.get("/health")
@@ -89,10 +137,10 @@ def usage_counts(completion) -> tuple[int, int, int]:
     return usage.total_tokens, usage.prompt_tokens, usage.completion_tokens
 
 
-def call_structured_model(question: str, model: ModelName) -> tuple[Answer, int, int, int]:
+def call_structured_model(prompt: str, model: ModelName) -> tuple[Answer, int, int, int]:
     completion = get_client().chat.completions.parse(
         model=model,
-        messages=[{"role": "user", "content": question}],
+        messages=[{"role": "user", "content": prompt}],
         response_format=Answer,
     )
 
@@ -126,6 +174,31 @@ def call_malformed_json_once(question: str, model: ModelName) -> tuple[str, int,
     return raw, total_tokens, prompt_tokens, completion_tokens
 
 
+def retrieve_chunks(question: str, top_k: int) -> list[RetrievedChunk]:
+    result = query_similar(question, top_k=top_k)
+    return [
+        RetrievedChunk(
+            id=match.id,
+            score=match.score,
+            document_id=(match.metadata or {}).get("document_id"),
+            chunk_index=(match.metadata or {}).get("chunk_index"),
+            source=(match.metadata or {}).get("source"),
+            text=(match.metadata or {}).get("text"),
+        )
+        for match in result.matches
+    ]
+
+
+def format_context(chunks: list[RetrievedChunk]) -> str:
+    if not chunks:
+        return "(no matching context was retrieved)"
+    return "\n\n".join(
+        f"[document_id: {chunk.document_id}, chunk_index: {chunk.chunk_index}, "
+        f"score: {chunk.score:.4f}]\n{chunk.text}"
+        for chunk in chunks
+    )
+
+
 @app.post("/ask")
 def ask(body: AskRequest) -> AskResponse:
     model = body.model or DEFAULT_MODEL
@@ -135,6 +208,12 @@ def ask(body: AskRequest) -> AskResponse:
     total_prompt_tokens = 0
     total_completion_tokens = 0
     start = time.perf_counter()
+
+    retrieved_chunks = retrieve_chunks(body.question, RETRIEVAL_TOP_K)
+    retrieved_chunk_ids = [chunk.id for chunk in retrieved_chunks]
+    grounded_prompt = GROUNDING_PROMPT_TEMPLATE.format(
+        context=format_context(retrieved_chunks), question=body.question
+    )
 
     for attempt in range(2):
         try:
@@ -173,7 +252,7 @@ def ask(body: AskRequest) -> AskResponse:
                 )
             else:
                 answer, tokens_used, prompt_tokens, completion_tokens = call_structured_model(
-                    body.question, model
+                    grounded_prompt, model
                 )
                 total_tokens_used += tokens_used
                 total_prompt_tokens += prompt_tokens
@@ -198,6 +277,7 @@ def ask(body: AskRequest) -> AskResponse:
                 latency_ms=latency_ms,
                 cost_usd=round(cost_usd, 6),
                 attempts=attempts,
+                retrieved_chunk_ids=retrieved_chunk_ids,
             )
         except (ValidationError, ValueError) as exc:
             last_error = str(exc)
@@ -215,3 +295,65 @@ def ask(body: AskRequest) -> AskResponse:
         status_code=502,
         detail=f"Model response failed schema validation after retry: {last_error}",
     )
+
+
+@app.post("/ingest")
+def ingest(body: IngestRequest) -> IngestResponse:
+    """Chunk, embed, and upsert a document into the Pinecone vector store.
+
+    curl -s -X POST http://127.0.0.1:8000/ingest \
+      -H "Content-Type: application/json" \
+      -d '{
+            "document_id": "handbook-v1",
+            "text": "Long document text goes here...",
+            "metadata": {"source": "handbook.pdf"}
+          }'
+    """
+    text = body.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="`text` must not be empty.")
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
+    )
+    chunks = splitter.split_text(text)
+    if not chunks:
+        raise HTTPException(
+            status_code=400, detail="No chunks were produced from `text`."
+        )
+
+    source = body.metadata.get("source") or ""
+    items = [
+        (
+            f"{body.document_id}::chunk::{i}",
+            chunk,
+            {
+                **body.metadata,
+                "document_id": body.document_id,
+                "chunk_index": i,
+                "source": source,
+            },
+        )
+        for i, chunk in enumerate(chunks)
+    ]
+    chunks_indexed = upsert_texts(items)
+
+    return IngestResponse(
+        document_id=body.document_id,
+        chunks_indexed=chunks_indexed,
+        status="ok",
+    )
+
+
+@app.get("/debug/retrieve")
+def debug_retrieve(q: str) -> DebugRetrieveResponse:
+    """Embed `q` and return the top-5 most similar chunks. Does not call the LLM.
+
+    curl -s "http://127.0.0.1:8000/debug/retrieve?q=What is Retrieval-Augmented Generation?"
+    """
+    query = q.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="`q` must not be empty.")
+
+    matches = retrieve_chunks(query, RETRIEVAL_TOP_K)
+    return DebugRetrieveResponse(query=query, matches=matches)
